@@ -1,0 +1,6 @@
+numpy>=1.22.4
+torch>=1.13.1
+transformers>=4.48.1
+
+# Optional: only required for --finetune-method lora
+peft>=0.4.0
