@@ -475,6 +475,40 @@ def evaluate_items(
     return results
 
 
+@torch.no_grad()
+def extract_representations(
+    model,
+    tokenizer,
+    items: list[dict],
+) -> np.ndarray:
+    """
+    Extract the final-layer hidden state at the last token position for each item.
+    This is the vector immediately preceding lm_head — the same representation
+    that lm_head reads out to produce Yes/No logits.
+
+    Returns float32 array of shape (len(items), hidden_size).
+    """
+    reps = []
+    for item in items:
+        input_ids = tokenizer.encode(item["prompt"], return_tensors="pt").to(model.device)
+        output = model(input_ids, output_hidden_states=True)
+        # hidden_states[-1]: final transformer layer output, shape (1, seq_len, hidden_size)
+        vec = output.hidden_states[-1][0, -1, :].float().cpu().numpy()
+        reps.append(vec)
+    return np.stack(reps)  # (n_items, hidden_size)
+
+
+def compute_rep_similarity_matrix(reps: np.ndarray, metric: str = "cosine") -> np.ndarray:
+    """
+    Compute the (n_items, n_items) pairwise similarity matrix.
+    metric: 'cosine' (L2-normalised dot product) or 'dot' (raw inner product).
+    """
+    if metric == "cosine":
+        norms = np.linalg.norm(reps, axis=1, keepdims=True)
+        reps = reps / np.maximum(norms, 1e-8)
+    return (reps @ reps.T).astype(np.float32)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Finetuning — shared helper
 # ═══════════════════════════════════════════════════════════════
@@ -941,6 +975,53 @@ def save_results(
     print(f"\nResults saved → {out_path}")
 
 
+def save_rep_sim(
+    output_dir: str,
+    items: list[dict],
+    pre_reps: np.ndarray,
+    post_reps: np.ndarray,
+    metric: str,
+) -> None:
+    """
+    Compute pairwise similarity matrices from pre- and post-finetuning representations
+    and save them to disk.
+
+    Saves:
+      rep_sim_pre.npy   — (n_items, n_items) float32, pre-finetuning
+      rep_sim_post.npy  — (n_items, n_items) float32, post-finetuning
+      rep_sim_meta.json — row/column metadata (one entry per dataset item)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    pre_sim  = compute_rep_similarity_matrix(pre_reps,  metric)
+    post_sim = compute_rep_similarity_matrix(post_reps, metric)
+
+    item_meta = [
+        {
+            "index":        idx,
+            "team_a":       it["team_a"],
+            "team_b":       it["team_b"],
+            "rank_a":       it["rank_a"],
+            "rank_b":       it["rank_b"],
+            "direction":    it["direction"],
+            "is_train":     it["is_train"],
+            "is_exception": it.get("is_exception", False),
+            "no_gt":        it.get("no_gt", False),
+            "label":        it["label"],
+            "gap":          it["gap"],
+        }
+        for idx, it in enumerate(items)
+    ]
+
+    np.save(Path(output_dir) / "rep_sim_pre.npy",  pre_sim)
+    np.save(Path(output_dir) / "rep_sim_post.npy", post_sim)
+    with open(Path(output_dir) / "rep_sim_meta.json", "w") as f:
+        json.dump({"metric": metric, "n_items": len(items), "items": item_meta}, f, indent=2)
+    print(
+        f"Rep-sim matrices ({metric}, {len(items)}\u00d7{len(items)}) saved \u2192 "
+        f"{output_dir}/rep_sim_{{pre,post}}.npy + rep_sim_meta.json"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
 # Argument parsing
 # ═══════════════════════════════════════════════════════════════
@@ -1029,6 +1110,18 @@ def parse_args() -> argparse.Namespace:
                    help="Directory for results.json")
     g.add_argument("--seed",       type=int, default=42)
 
+    # --- Representation similarity ---
+    g = p.add_argument_group("Representation similarity")
+    g.add_argument("--save-rep-sim", action="store_true",
+                   help="Extract final-layer hidden states and save pairwise similarity matrices "
+                        "(n_items \u00d7 n_items) pre- and post-finetuning. "
+                        "Saved to rep_sim_{pre,post}.npy + rep_sim_meta.json in --output-dir.")
+    g.add_argument("--rep-sim-metric", choices=["cosine", "dot"], default="cosine",
+                   help="Similarity metric for --save-rep-sim (default: cosine)")
+    g.add_argument("--rep-sim-only", action="store_true",
+                   help="Skip finetuning and only extract the representation similarity matrix "
+                        "(implies --save-rep-sim and --finetune-method none)")
+
     return p.parse_args()
 
 
@@ -1039,9 +1132,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if args.rep_sim_only:
+        args.save_rep_sim = True
+        args.finetune_method = "none"
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     # ── 1. Build hierarchy ──────────────────────────────────────
     exception = tuple(args.exception) if args.exception is not None else None
@@ -1124,6 +1224,9 @@ def main() -> None:
     # ── 4. Pre-finetuning evaluation ────────────────────────────
     print("\nEvaluating (pre-finetuning)…")
     pre_results = evaluate_items(model, tokenizer, dataset, yes_id, no_id)
+    if args.save_rep_sim:
+        print("Extracting representations (pre-finetuning)…")
+        pre_reps = extract_representations(model, tokenizer, dataset)
 
     # ── 5. Finetuning ───────────────────────────────────────────
     if args.finetune_method == "none":
@@ -1172,6 +1275,10 @@ def main() -> None:
     # ── 6. Post-finetuning evaluation (always runs) ─────────────
     print("\nEvaluating (post-finetuning)…")
     post_results = evaluate_items(model, tokenizer, dataset, yes_id, no_id)
+    if args.save_rep_sim:
+        print("Extracting representations (post-finetuning)…")
+        post_reps = extract_representations(model, tokenizer, dataset)
+        save_rep_sim(args.output_dir, dataset, pre_reps, post_reps, args.rep_sim_metric)
 
     # ── 7. Display & save ───────────────────────────────────────
     print_results_table(pre_results, post_results)
